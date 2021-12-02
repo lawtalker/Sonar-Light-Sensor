@@ -1,4 +1,4 @@
-#Sonar Light Switch
+Sonar Light Switch
  
 I use this sketch for an outdoor light in the middle of a stairway. 
 There's also a light on a porch at the top of a second, higher run of 
