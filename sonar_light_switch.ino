@@ -142,7 +142,7 @@ void setup() {
   digitalWrite(pTrigU, LOW);
   digitalWrite(pLight, LOW);
 
-  /* open console for debug and setup RGB LED */
+  /* open console for debug */
   #ifdef DEBUG  
   Serial.begin(9600);
   while (!Serial) {
