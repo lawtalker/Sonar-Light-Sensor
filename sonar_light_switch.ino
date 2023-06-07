@@ -10,7 +10,7 @@
  *        switch to turn power off during daylight)
  *  v1.0: 2013 Oct. 18; uses light sensor for daylight detection
  * 
- *  @date:    June 6, 2023
+ *  @date:    June 7, 2023
  *  @version: 2.1
  *  
  *  Copyright (c) 2013, 2021, 2023 Michael Kwun
