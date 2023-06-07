@@ -1,8 +1,8 @@
-//#define DEBUG
 /*
  *  Sonar Light Switch
  * 
  *  Changelog:
+ *  v2.1: 2023 June 7; add logging to Google Sheet and cleaned up code
  *  v2.0: 2021 Dec. 1; uses two range sensors to turn on light from either 
  *        direction, and switched to wifi Arduino to turn on porch light when 
  *        going up
@@ -10,10 +10,10 @@
  *        switch to turn power off during daylight)
  *  v1.0: 2013 Oct. 18; uses light sensor for daylight detection
  * 
- *  @date:    December 1, 2021
- *  @version: 2.0
+ *  @date:    June 6, 2023
+ *  @version: 2.1
  *  
- *  Copyright (c) 2013, 2021 Michael Kwun
+ *  Copyright (c) 2013, 2021, 2023 Michael Kwun
  *  
  *  Permission is hereby granted, free of charge, to any person obtaining
  *  a copy of this software and associated documentation (the "Software"), 
@@ -82,18 +82,29 @@
  *    blue-w  echoL
  *    orng    trigU
  *    orng-w  echoU
- *    grn     +5v (if vin is not +5v)
- *    grn-w   light
+ *    grn     light
+ *    grn-w   +5v (if vin is not +5v)
  *    brwn    gnd
  *    brwn-w  vin
- * 
+ *    
+ *  Debug messages are sent to console, and less verbose log messages are 
+ *  sent to a Google Form. To set up the form, create a Google Form with a 
+ *  single short answer field. Type anything into the short answer field, 
+ *  click "Get pre-filled link," click "Get Link," and then click "Copy 
+ *  Link." From the copied link, the long string after "/d/e/" is the 
+ *  formID, and the number after "entry." is the entryID, which should be 
+ *  defined in the global constants, below.
+ *  
  */
 
 #include <SPI.h>
 #include <WiFiNINA.h>
 
+/* for WiFiNINA */
+WiFiClient client;
+
 /* Arduino pins */
-const int pLight =  3;           // controls relay for stairway light
+const int pLight =  3;           // controls relay for stairway
 const int pTrigL =  5;           // ping lower sensor
 const int pEchoL =  6;           // echo lower sensor
 const int pTrigU =  8;           // ping upper sensor
@@ -104,6 +115,11 @@ const char ssid[] = "YourSSID";
 const char passwd[] = "YourWiFiPassword";
 const IPAddress porch_light_IP (192,168,1,100); // Kasa porch switch
 const int porch_light_port = 9999;
+
+/* IDs for Google Form for logging */
+const char formID[] =
+  "very-very-long-string-for-google-form-ID";
+const char entryID[] = "123456789";
 
 /*  max ping time (in microseconds) that will trigger light 
  *  (74 microsconds per inch or 29 per cm, multiplied by 2 for roundtrip)
@@ -133,9 +149,7 @@ void setup() {
   pinMode(pTrigL, OUTPUT);
   pinMode(pTrigU, OUTPUT);
   
-  #ifdef DEBUG
   pinMode(LED_BUILTIN, OUTPUT);
-  #endif
   
   /* these should already all be low, but let's be sure */
   digitalWrite(pTrigL, LOW);
@@ -143,7 +157,6 @@ void setup() {
   digitalWrite(pLight, LOW);
 
   /* open console for debug */
-  #ifdef DEBUG  
   Serial.begin(9600);
   while (!Serial) {
     ;
@@ -158,7 +171,6 @@ void setup() {
   Serial.println(light_length, DEC);
   Serial.print("Sensors triggered by body within (inches): ");
   Serial.println(ping_range/2/74, DEC); 
-  #endif
 
   /* to ensure clean trigger for first ping */
   delay(10);
@@ -204,20 +216,76 @@ int find_body() {
   return body;
 }
 
-/* subroutine: send string to client using TSHP. */
-void TSHP_write(WiFiClient &cl, char* msg) {
-  
-  /* send TSHP length header (used by TSHP for TCP but not UDP) */
-  cl.write((int)0);
-  cl.write((int)0);
-  cl.write(highByte(strlen(msg)));
-  cl.write(lowByte(strlen(msg)));
+/* subroutine: remote logging via a Google Form. */
+void form_log(char* msg) {
 
-  /* send TSHP payload (with required weak obfuscation) */
-  int key = 0xAB; // TSHP magic number
-  for (int i = 0; msg[i] != '\0'; i++) {
-    cl.write(key ^= msg[i]);
+
+  /* open https connection to Google Docs */
+  if (client.connectSSL("docs.google.com", 443)) {
+
+    /* beginning of GET for Google Form */
+    client.print("GET /forms/d/e/");
+    client.print(formID);
+    client.print("/formResponse?&submit=Submit?usp=pp_url&entry.");
+    client.print(entryID);
+    client.print("=");
+
+    /* percent encode the log entry, one char at a time */
+    while ( *msg != '\0') {
+      /* passthrough unreserved chars per RFC 3986 sec. 2.3 
+         ALPHA / DIGIT / "-" / "." / "_" / "~"               */
+      if (    ('a' <= *msg && *msg <= 'z') 
+           || ('A' <= *msg && *msg <= 'Z') 
+           || ('0' <= *msg && *msg <= '9') 
+           || *msg == '-' || *msg == '.' 
+           || *msg == '_' || *msg == '~'   ) {
+        client.print(*msg);
+      } 
+
+      /* percent encode everything else per RFC 3986 sec. 2.1 */ 
+      else {
+        client.print("%");
+        if ( *msg < 16 ) {
+          client.print("0"); // add leading zero if necessary
+        }
+        client.print(*msg,HEX);
+      }
+      msg++; // next character in the log entry
+    }
+
+    client.println(" HTTP/1.1"); // end of GET
+    
+    client.println("Host: docs.google.com");
+    client.println("Connection: close");
+    client.println();
+
+    client.stop();
+
   }
+}
+
+/* subroutine: tell porch light to turn on using TSHP. */
+int porch_on() {
+  
+  if (client.connect(porch_light_IP, porch_light_port)) {
+
+    /* send TSHP length header (used by TSHP for TCP but not UDP) */
+    client.write((int)0);
+    client.write((int)0);
+    client.write(highByte(strlen(msg_on)));
+    client.write(lowByte(strlen(msg_on)));
+    
+    /* send TSHP payload (with required weak obfuscation) */
+    int key = 0xAB; // TSHP magic number
+    for (int i = 0; msg_on[i] != '\0'; i++) {
+      client.write(key ^= msg_on[i]);
+    }
+    client.stop();
+
+    return 1; // connection succeeded
+  }
+  
+  return 0; // connection failed
 }
 
 /***************
@@ -230,7 +298,6 @@ void loop() {
   /* one-time initialization, variables survive looping */
   static unsigned long body_time; // last time a body was detected
   static int up_down;             // why stairway light was turned on
-  static WiFiClient client;
   static unsigned long wifi_last_attempt;
   static bool startup = true;
   static bool connect_fail = false;
@@ -267,7 +334,6 @@ void loop() {
       
       wifi_last_attempt = the_time;
       
-      #ifdef DEBUG
       Serial.print("Connecting to ");
       Serial.print(ssid);
       Serial.print(" WiFi AP because status is: ");
@@ -290,11 +356,9 @@ void loop() {
           Serial.println(".");
           break;
       }
-      #endif
       
       wifi_status = WiFi.begin(ssid, passwd);
       
-      #ifdef DEBUG
       Serial.print("WiFi.begin() exited with status ");
       switch (wifi_status) {
         case WL_IDLE_STATUS:
@@ -302,6 +366,7 @@ void loop() {
           break;
         case WL_CONNECTED:
           Serial.println("CONNECTED.");
+          form_log("wifi connected");
           break;
         case WL_CONNECT_FAILED:
           Serial.println("CONNECT_FAILED.");
@@ -312,7 +377,6 @@ void loop() {
           Serial.println(".");
           break;
       }
-      #endif
     }
   } /* end wifi connection block */ 
     
@@ -321,7 +385,6 @@ void loop() {
     
     body_time = the_time;
     
-    #ifdef DEBUG
     switch(sensor) {
       case 1:
         Serial.println("Lower sensor triggered.");
@@ -333,18 +396,16 @@ void loop() {
         Serial.println("Both sensors triggered.");
         break;    
     }
-    #endif
 
     /* Body found & light off: turn on light & store trigger */
     if (! digitalRead(pLight)) {
  
       digitalWrite(pLight, HIGH);
+      digitalWrite(LED_BUILTIN, HIGH);
       up_down = sensor;
 
-      #ifdef DEBUG
-      digitalWrite(LED_BUILTIN, HIGH);
       Serial.println("Turned on stairway light.");
-      #endif
+      form_log("stairway light on");
 
     } /* end body found & light off */
 
@@ -357,42 +418,32 @@ void loop() {
      */
     else if (up_down == 1 && sensor & 2 && wifi_status == WL_CONNECTED) {
 
-      #ifdef DEBUG
       Serial.println("Someone coming up! ");
-      #endif
 
       /*  connect() is blocking, and a failed connection seems to take 
        *   ~30 seconds. If we've had a recent failed connection, don't try 
        *   again for a while.
        */
       if (!connect_fail) {
-        #ifdef DEBUG
         Serial.println("Trying to connect to Kasa light switch.");
-        #endif
-        if (client.connect(porch_light_IP, porch_light_port)) {
-          TSHP_write(client, msg_on);
+        if (porch_on()) {
           up_down = 0;  // turn on porch light only once
      
-          #ifdef DEBUG
           Serial.println("Told Kasa light switch to turn on porch light.");
-          #endif
+          form_log("porch light on");
         }
         else {
           connect_fail = true;
           connect_fail_time = the_time;
-          #ifdef DEBUG
           Serial.println("Connection to Kasa light switch failed.");
           Serial.print("Won't try again for ");
           Serial.print(connect_try_time, DEC);
           Serial.println(" ms.");
-          #endif
         }
       }
-      #ifdef DEBUG
       else {
         Serial.println("Skipping Kasa due to recent failed connection.");
-      }
-      #endif /* end Kasa message handling */     
+      } /* end Kasa message handling */     
         
     } /* end body found & light on */
   } /* end body found*/
@@ -408,12 +459,11 @@ void loop() {
     
     digitalWrite(pLight, LOW);
 
-    #ifdef DEBUG
     digitalWrite(LED_BUILTIN, LOW);
     Serial.print("No body detected for ");
     Serial.print(light_length, DEC);
     Serial.println(" ms, so turned stairway light off.");
-    #endif
+    form_log("stairway light off");
   } /* end no body found */
 
   /* clear connection fail flag if appropriate */
