@@ -2,16 +2,17 @@
  *  Sonar Light Switch
  * 
  *  Changelog:
- *  v2.1: 2023 June 7; add logging to Google Sheet and cleaned up code
- *  v2.0: 2021 Dec. 1; uses two range sensors to turn on light from either 
- *        direction, and switched to wifi Arduino to turn on porch light when 
+ *  v2.2: 2023 June 8: improve logging and clean up code
+ *  v2.1: 2023 June 7; add logging to Google Sheet and clean up code
+ *  v2.0: 2021 Dec. 1; use two range sensors to turn on light from either 
+ *        direction, and switch to wifi Arduino to turn on porch light when 
  *        going up
  *  v1.1: 2021 Nov. 12; eliminate daylight sensor logic (relies on a smart 
  *        switch to turn power off during daylight)
- *  v1.0: 2013 Oct. 18; uses light sensor for daylight detection
+ *  v1.0: 2013 Oct. 18; use light sensor for daylight detection
  * 
- *  @date:    June 7, 2023
- *  @version: 2.1
+ *  @date:    June 8, 2023
+ *  @version: 2.2
  *  
  *  Copyright (c) 2013, 2021, 2023 Michael Kwun
  *  
@@ -100,8 +101,8 @@
 #include <SPI.h>
 #include <WiFiNINA.h>
 
-/* for WiFiNINA */
-WiFiClient client;
+/*  We use an external smart switch that cuts power at sunrise, and switches
+ *  power back on at sunset, which means millis() will never overflow  */
 
 /* Arduino pins */
 const int pLight =  3;           // controls relay for stairway
@@ -120,6 +121,9 @@ const int porch_light_port = 9999;
 const char formID[] =
   "very-very-long-string-for-google-form-ID";
 const char entryID[] = "123456789";
+
+/* generic client for WiFiNINA connections */
+WiFiClient client;
 
 /*  max ping time (in microseconds) that will trigger light 
  *  (74 microsconds per inch or 29 per cm, multiplied by 2 for roundtrip)
@@ -141,14 +145,12 @@ const unsigned long connect_try_time = 15UL * 60 * 1000;
 /* Plaintext JSON message to turn on the porch light. */
 const char msg_on[] = "{\"system\":{\"set_relay_state\":{\"state\":1}}}";
 
-
 /* initial setup at powerup */
 void setup() {
   
   pinMode(pLight, OUTPUT);
   pinMode(pTrigL, OUTPUT);
   pinMode(pTrigU, OUTPUT);
-  
   pinMode(LED_BUILTIN, OUTPUT);
   
   /* these should already all be low, but let's be sure */
@@ -161,10 +163,7 @@ void setup() {
   while (!Serial) {
     ;
   }
-  Serial.println();
-  Serial.println();
-  Serial.println("Let there be light!");
-  Serial.println("Debug serial connection is open.");
+  Serial.println("LET THERE BE LIGHT!");
   Serial.print("Stairway light: pin ");
   Serial.println(pLight, DEC);
   Serial.print("Light time (ms): ");
@@ -176,7 +175,8 @@ void setup() {
   delay(10);
 }
 
-/* subroutine: ping two range detectors, return results in 1 & 2 bits */
+/* subroutine: ping two range detectors
+   return results in 1 & 2 bits */
 int find_body() {
   
   int body = 0;
@@ -216,11 +216,34 @@ int find_body() {
   return body;
 }
 
-/* subroutine: remote logging via a Google Form. */
-void form_log(char* msg) {
+/* subroutine: remote logging via a Google Form. 
+ * sends msgs to console and, if possible, a Google Form
+ * skips Form if no wifi or recent failed connection
+ * 
+ * returns 1 if Form connection succeeded, and 0 if not 
+ */
+int form_log(char* msg) {
 
+  static unsigned long down_time = 0;
 
-  /* open https connection to Google Docs */
+  /* send message to console */
+  Serial.println(msg);
+
+  /* don't log to Google Form if no wifi */
+  if (WiFi.status() != WL_CONNECTED) {
+    return 0;
+  }
+  
+  /* connectSSL() is blocking, and a failed connection will block for ~30
+     seconds, so don't try if we've had a failure recently. */
+  if (down_time) {
+    if (millis() < down_time + connect_try_time) {
+      return 0; 
+    }
+    down_time = 0;
+  }
+
+  /* if no recent connection failure, open an https connection */
   if (client.connectSSL("docs.google.com", 443)) {
 
     /* beginning of GET for Google Form */
@@ -261,12 +284,33 @@ void form_log(char* msg) {
 
     client.stop();
 
+    return 1;   // logged entry
   }
+
+  /* https connection failed */
+  down_time = millis();
+  Serial.println("Connection to Google Form failed.");
+  return 0;
+  
 }
 
-/* subroutine: tell porch light to turn on using TSHP. */
+/* subroutine: tell porch light to turn on using TSHP. 
+   returns 1 if successful */
 int porch_on() {
-  
+
+  static unsigned long down_time = 0;
+
+  /* connect() is blocking, and a failed connection will block for ~30
+     seconds, so don't try if we've had a failure recently. */
+  if (down_time) {
+    if (millis() < down_time + connect_try_time) {
+      return 0; 
+    }
+    down_time = 0;
+  }
+
+  /* if no recent connection failure, try to send the Kasa switch an
+     "on" message via TCP and TSHP */ 
   if (client.connect(porch_light_IP, porch_light_port)) {
 
     /* send TSHP length header (used by TSHP for TCP but not UDP) */
@@ -281,11 +325,79 @@ int porch_on() {
       client.write(key ^= msg_on[i]);
     }
     client.stop();
-
+    
+    form_log("Asked Kasa to turn on porch light.");
+    
     return 1; // connection succeeded
   }
   
-  return 0; // connection failed
+  /* Kasa connection failed */
+  down_time = millis();
+  Serial.println("Connection to Kasa light switch failed.");
+
+  return 0;
+}
+
+/* subroutine: check wifi and connect if needed
+ * won't try if failed recently, except multiple tries are allowed at startup
+ * 
+ * returns 1 if connected
+ */
+int wifi_check() {
+  static unsigned long wifi_last_attempt = -wifi_try_time;
+    
+  unsigned long the_time = millis();
+  int wifi_status = WiFi.status();
+
+  /* if we're connected, all is well */
+  if (wifi_status == WL_CONNECTED) {
+    return 1; 
+  }
+
+  /* if we had a failed attempt recently and it's not shortly after
+     shortly after power up, don't try again, because WiFi.begin()
+     is blocking and takes 3-5 seconds */
+  if (the_time < wifi_last_attempt + wifi_try_time) {
+    return 0;
+  }
+
+  /* update last attempt time unless recently powered up */
+  if (the_time > wifi_try_time) {
+    wifi_last_attempt = the_time;
+  }
+
+  /* report connection attempt to console */
+  Serial.print("Connecting to ");
+  Serial.print(ssid);
+  Serial.print(" WiFi AP because status is: ");
+  switch (wifi_status) {
+    case WL_IDLE_STATUS:
+      Serial.println("IDLE.");
+      break;
+    case WL_CONNECT_FAILED:
+      Serial.println("CONNECT_FAILED.");
+      break;
+    case WL_CONNECTION_LOST:
+      Serial.println("CONNECTION_LOST.");
+      break;
+    case WL_DISCONNECTED:
+      Serial.println("DISCONNECTED.");
+      break;
+    default:
+      Serial.print("code ");
+      Serial.print(wifi_status,DEC);
+      Serial.println(".");
+      break;
+  }
+
+  /* actual connection attempt */
+  if (WiFi.begin(ssid, passwd) == WL_CONNECTED) {
+    form_log("WiFi CONNECTED.");
+    return 1;
+  }
+  Serial.println("WiFi did not connect.");
+  return 0;
+
 }
 
 /***************
@@ -295,18 +407,14 @@ int porch_on() {
  ***************/
 void loop() {
 
-  /* one-time initialization, variables survive looping */
-  static unsigned long body_time; // last time a body was detected
-  static int up_down;             // why stairway light was turned on
-  static unsigned long wifi_last_attempt;
-  static bool startup = true;
-  static bool connect_fail = false;
-  static unsigned long connect_fail_time;
-
-  /* initialized each time through the loop */
-  unsigned long the_time = millis(); // rollover after ~50 days
-  int wifi_status = WiFi.status();
-
+  /* one-time initialization, variables survive looping 
+     initializing to -light_length basically means "a long time ago" */
+  static unsigned long 
+    body_time = -light_length,  // last time body detected
+    low_time = -light_length,   // last time body detected at low sensor
+    ping_time = 60UL*60*1000;   // one hour from start up
+  static int up_down;           // sensor that triggered light
+  
   /****
    * 
    * Our approach is to loop repeatedly through this task list:
@@ -320,132 +428,50 @@ void loop() {
    * 
    ****/
 
-  /*  Connect to wifi if necessary, but Wifi.begin() is blocking, so if 
-   *  attempt fails, don't try again for a while except that we'll allow 
-   *  multiple attempts right after powering up. (A successful connection can 
-   *  complete in under 3 seconds, as does a failure due to a missing AP. A 
-   *  failure due an incorrect password seems to take around 5 seconds.)
-   */
-  if (startup && the_time > wifi_try_time) {
-    startup = false;
+  /* Check wifi, and attempt to connect if needed */
+  int wifi_status = wifi_check();  
+
+  /* log proof of life every hour */
+  unsigned long the_time = millis(); 
+  if (the_time > ping_time) {
+    form_log("Hourly ping.");
+    ping_time += 60UL*60*1000;
   }
-  if (wifi_status != WL_CONNECTED) {    
-    if (startup || the_time - wifi_last_attempt > wifi_try_time) {   
-      
-      wifi_last_attempt = the_time;
-      
-      Serial.print("Connecting to ");
-      Serial.print(ssid);
-      Serial.print(" WiFi AP because status is: ");
-      switch (wifi_status) {
-        case WL_IDLE_STATUS:
-          Serial.println("IDLE.");
-          break;
-        case WL_CONNECT_FAILED:
-          Serial.println("CONNECT_FAILED.");
-          break;
-        case WL_CONNECTION_LOST:
-          Serial.println("CONNECTION_LOST.");
-          break;
-        case WL_DISCONNECTED:
-          Serial.println("DISCONNECTED.");
-          break;
-        default:
-          Serial.print("code ");
-          Serial.print(wifi_status,DEC);
-          Serial.println(".");
-          break;
-      }
-      
-      wifi_status = WiFi.begin(ssid, passwd);
-      
-      Serial.print("WiFi.begin() exited with status ");
-      switch (wifi_status) {
-        case WL_IDLE_STATUS:
-          Serial.println("IDLE.");
-          break;
-        case WL_CONNECTED:
-          Serial.println("CONNECTED.");
-          form_log("wifi connected");
-          break;
-        case WL_CONNECT_FAILED:
-          Serial.println("CONNECT_FAILED.");
-          break;
-        default:
-          Serial.print("code ");
-          Serial.print(wifi_status,DEC);
-          Serial.println(".");
-          break;
-      }
-    }
-  } /* end wifi connection block */ 
-    
-  /* check range sensors and process results */
+
+  /* check range sensors and process results */  
   if ( int sensor = find_body() ) {
     
     body_time = the_time;
-    
-    switch(sensor) {
-      case 1:
-        Serial.println("Lower sensor triggered.");
-        break;
-      case 2:
-        Serial.println("Upper sensor triggered.");
-        break;
-      case 3:
-        Serial.println("Both sensors triggered.");
-        break;    
+
+    if (sensor & 1) {
+      Serial.println("Lower sensor triggered.");    
+      low_time = the_time;  
+    }
+    if (sensor & 2) {
+      Serial.println("Upper sensor triggered.");  
     }
 
-    /* Body found & light off: turn on light & store trigger */
+    /* Body found & light off: turn on light */
     if (! digitalRead(pLight)) {
  
       digitalWrite(pLight, HIGH);
       digitalWrite(LED_BUILTIN, HIGH);
+
       up_down = sensor;
 
-      Serial.println("Turned on stairway light.");
-      form_log("stairway light on");
-
+      form_log("Stairway light on");
+ 
     } /* end body found & light off */
 
-    /*  Body found & light on: 
-     *  
-     *  If light was triggered by just the bottom sensor
-     *  AND upper sensor is now triggered
-     *  AND we have a wifi connection
-     *  THEN ask Kasa to turn on the porch light (but only once).
-     */
-    else if (up_down == 1 && sensor & 2 && wifi_status == WL_CONNECTED) {
-
-      Serial.println("Someone coming up! ");
-
-      /*  connect() is blocking, and a failed connection seems to take 
-       *   ~30 seconds. If we've had a recent failed connection, don't try 
-       *   again for a while.
-       */
-      if (!connect_fail) {
-        Serial.println("Trying to connect to Kasa light switch.");
-        if (porch_on()) {
-          up_down = 0;  // turn on porch light only once
-     
-          Serial.println("Told Kasa light switch to turn on porch light.");
-          form_log("porch light on");
-        }
-        else {
-          connect_fail = true;
-          connect_fail_time = the_time;
-          Serial.println("Connection to Kasa light switch failed.");
-          Serial.print("Won't try again for ");
-          Serial.print(connect_try_time, DEC);
-          Serial.println(" ms.");
-        }
-      }
-      else {
-        Serial.println("Skipping Kasa due to recent failed connection.");
-      } /* end Kasa message handling */     
-        
+    /* body found & light on */
+    /* turn on porch light if sosmeone moving from lower to upper and we have wifi */
+    else if (sensor & 2 
+          && up_down == 1 
+          && the_time < low_time + light_length 
+          && wifi_status ) {
+      porch_on();
     } /* end body found & light on */
+
   } /* end body found*/
 
   /*  
@@ -455,24 +481,14 @@ void loop() {
    *  AND last body detected was at least light_length ago
    *  THEN turn off stairway light.
    */
-  else if (digitalRead(pLight) && the_time - body_time > light_length) {
-    
+  else if (digitalRead(pLight) && the_time > body_time + light_length) {
     digitalWrite(pLight, LOW);
-
     digitalWrite(LED_BUILTIN, LOW);
-    Serial.print("No body detected for ");
-    Serial.print(light_length, DEC);
-    Serial.println(" ms, so turned stairway light off.");
-    form_log("stairway light off");
+    form_log("Stairway light off.");
   } /* end no body found */
 
-  /* clear connection fail flag if appropriate */
-  if (connect_fail && the_time - connect_fail_time > connect_try_time) {
-    connect_fail = false;
-  }
-
   /* delay so that we loop no more than 10 times per second */
-  while (millis() - the_time < 100) {
+  while (millis() < the_time + 100) {
     ;
   }
 } /* end loop() */
