@@ -1,21 +1,31 @@
 /*
- *  Sonar Light Switch
+ * Sonar Light Switch
  * 
- *  Changelog:
- *  v2.2: 2023 June 8: improve logging and clean up code
- *  v2.1: 2023 June 7; add logging to Google Sheet and clean up code
- *  v2.0: 2021 Dec. 1; use two range sensors to turn on light from either 
- *        direction, and switch to wifi Arduino to turn on porch light when 
- *        going up
- *  v1.1: 2021 Nov. 12; eliminate daylight sensor logic (relies on a smart 
- *        switch to turn power off during daylight)
- *  v1.0: 2013 Oct. 18; use light sensor for daylight detection
+ * Changelog:
+ * v3.0: 2026 Jan. 18: Reliability and diagnostic overhaul
+ *       - include day/night logic natively via NTP and Dusk2Dawn
+ *       - eliminates reliance on external smart switch (reduces reboots)
+ *       - adds heartbeats to keep ARP/Kasa and SSL/Google connections warm
+ *       - adds (optional) diagnostic LEDs (2, 4, 7) for debugging
+ *       - non-blocking wifi code to prevent sonar lag during signal drops
+ *       - strategic logging for system boot, wifi recovery, and NTP failures
+ *       - switch to subtraction logic for millis() to avoid overflow issues
+ *       - defer logging to Google form until a quiet period
+ *       - change porch light on algo
+ *       - added porch light off algo
+ * v2.2: 2023 June 8: improve logging and clean up code
+ * v2.1: 2023 June 7; add logging to Google Sheet and clean up code
+ * v2.0: 2021 Dec. 1; use two range sensors to turn on light from either 
+ *       direction, and switch to wifi Arduino to turn on porch light when 
+ *       going up
+ * v1.1: 2021 Nov. 12; eliminate daylight sensor logic (relies on a smart 
+ *       switch to turn power off during daylight)
+ * v1.0: 2013 Oct. 18; use light sensor for daylight detection
  * 
- *  @date:    June 8, 2023
- *  @version: 2.2
- *  
- *  Copyright (c) 2013, 2021, 2023 Michael Kwun
- *  
+ * @date:    January 18, 2026
+ * @version: 3.0
+ * Copyright (c) 2013, 2021, 2023, 2026 Michael Kwun
+ *
  *  Permission is hereby granted, free of charge, to any person obtaining
  *  a copy of this software and associated documentation (the "Software"), 
  *  to deal in the Software without restriction, including without 
@@ -39,14 +49,8 @@
  *  I use this sketch for an outdoor light in the middle of a stairway. 
  *  There's also a light on a porch at the top of a second, higher run of 
  *  stairs. Both lights are connected to TP-Link Kasa smart switches 
- *  (HS-200). The stairway switch is programmed to turn off power to the 
- *  stairway light during the daytime. That also turns off power to the 
- *  Arduino, so motion during the daytime will not trigger the light. 
- *  
- *  When the Kasa switch for the stairway light is on, the light still will 
- *  not turn on unless a pin on the Arduino is held high, triggering a relay.
- *  That is, the stairway light is controlled by two switches in series,
- *  both of which must be on for the light to be on.
+ *  (HS-200). The stairway switch is generally always on, and the sketch
+ *  then controls the actual light.
  *  
  *  The sketch is designed for use with an Arduino Uno WiFi rev 2, so we have 
  *  a network interface. We also use two ultrasonic ranging sensors (HC-SR04 
@@ -97,398 +101,276 @@
  *  defined in the global constants, below.
  *  
  */
-
-#include <SPI.h>
-#include <WiFiNINA.h>
-
-/*  We use an external smart switch that cuts power at sunrise, and switches
- *  power back on at sunset, which means millis() will never overflow  */
-
-/* Arduino pins */
-const int pLight =  3;           // controls relay for stairway
-const int pTrigL =  5;           // ping lower sensor
-const int pEchoL =  6;           // echo lower sensor
-const int pTrigU =  8;           // ping upper sensor
-const int pEchoU =  9;           // echo upper sensor
-
-/* network constants (IP address for porch light switch is hardcoded) */
-const char ssid[] = "YourSSID";
-const char passwd[] = "YourWiFiPassword";
-const IPAddress porch_light_IP (192,168,1,100); // Kasa porch switch
-const int porch_light_port = 9999;
-
-/* IDs for Google Form for logging */
-const char formID[] =
-  "very-very-long-string-for-google-form-ID";
-const char entryID[] = "123456789";
-
-/* generic client for WiFiNINA connections */
-WiFiClient client;
-
-/*  max ping time (in microseconds) that will trigger light 
- *  (74 microsconds per inch or 29 per cm, multiplied by 2 for roundtrip)
- *  actual distance will vary by an inch or so with ambient temperature
+/*
+ * Sonar Light Switch v3.0
+ * * Optimized for: Arduino Uno WiFi Rev 2
+ * * Created by: Michael Kwun
+ * * NOTE: This version contains placeholders. Replace all "REPLACE_ME" 
+ * strings with your actual network and Google Form credentials.
  */
+
+#include <avr/wdt.h>
+#include <WiFiNINA.h>
+#include <NTPClient.h>
+#include <WiFiUdp.h>
+#include <TimeLib.h>
+#include <Dusk2Dawn.h>
+
+/* --- Precision Logging Registry --- */
+struct LogEvent {
+  unsigned long* timestamp;
+  const char* msg;
+};
+
+unsigned long logTimeOn = 0, logTimeOff = 0, logTimeWiFi = 0, logTimePorchOn = 0, logTimeKasaFail = 0;
+
+LogEvent events[] = {
+  {&logTimeWiFi, "WiFi RECONNECTED"},
+  {&logTimeOn, "Stair light ON"},
+  {&logTimePorchOn, "Porch light ON"},
+  {&logTimeOff, "Stair light OFF"},
+  {&logTimeKasaFail, "Kasa Porch Timeout"}
+};
+
+const int numEvents = sizeof(events) / sizeof(events[0]);
+
+/* --- Pins --- */
+const int pLedRelay = 2, pLedLower = 4, pLedUpper = 7;
+const int pLight = 3, pTrigL = 5, pEchoL = 6, pTrigU = 8, pEchoU = 9;
+
+/* --- Network & Config (REPLACE WITH YOUR DATA) --- */
+const char ssid[] = "YOUR_WIFI_SSID";
+const char passwd[] = "YOUR_WIFI_PASSWORD";
+const IPAddress porch_light_IP (192,168,1,100); // Your Kasa Switch Static IP
+const int porch_light_port = 9999;
+const char formID[] = "YOUR_GOOGLE_FORM_ID_STRING";
+const char entryID[] = "YOUR_ENTRY_ID_NUMBER";
+
+/* --- Timing --- */
 const unsigned long ping_range = 24UL * 74 * 2;
+const unsigned long light_length = 60000UL;      
+const unsigned long wifi_try_time = 60000UL;     
+const unsigned long heartbeatInterval = 1800000UL; 
+const unsigned long ssl_keepalive_interval = 25000UL;
+const unsigned long porch_duration = 300000UL;
 
-/*  Time in milliseconds that stairway light should stay on without 
- *  detecting a body again. E.g. (90UL*1000) would mean 90 seconds
- */ 
-const unsigned long light_length = 60UL * 1000;
+/* --- Objects & State --- */
+WiFiClient client;
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "pool.ntp.org", -28800); // Offset for PST (-8)
+Dusk2Dawn sf(37.7749, -122.4194, -8); // SF Lat/Long
 
-/* Minimum time between attempts to connect to WiFi. */
-const unsigned long wifi_try_time = 60UL * 1000; 
+unsigned long body_time = 0, low_detect_time = 0, up_detect_time = 0;
+unsigned long lastHeartbeat = -1800001, last_ssl_activity = 0;
+unsigned long porch_auto_off_time = 0;
 
-/* Minimum time between attempts to connect to Kasa switch. */
-const unsigned long connect_try_time = 15UL * 60 * 1000; 
+// Solar Cache
+int cachedSunrise = 0, cachedSunset = 0;
+unsigned long lastSunUpdate = -3600001;
 
-/* Plaintext JSON message to turn on the porch light. */
-const char msg_on[] = "{\"system\":{\"set_relay_state\":{\"state\":1}}}";
-
-/* initial setup at powerup */
 void setup() {
-  
-  pinMode(pLight, OUTPUT);
-  pinMode(pTrigL, OUTPUT);
-  pinMode(pTrigU, OUTPUT);
+  pinMode(pLight, OUTPUT); pinMode(pTrigL, OUTPUT); pinMode(pEchoL, INPUT);
+  pinMode(pTrigU, OUTPUT); pinMode(pEchoU, INPUT);
+  pinMode(pLedRelay, OUTPUT); pinMode(pLedLower, OUTPUT); pinMode(pLedUpper, OUTPUT);
   pinMode(LED_BUILTIN, OUTPUT);
   
-  /* these should already all be low, but let's be sure */
-  digitalWrite(pTrigL, LOW);
-  digitalWrite(pTrigU, LOW);
-  digitalWrite(pLight, LOW);
+  digitalWrite(pTrigL, LOW); digitalWrite(pTrigU, LOW); digitalWrite(pLight, LOW);
 
-  /* open console for debug */
   Serial.begin(9600);
-  while (!Serial) {
-    ;
-  }
-  Serial.println("LET THERE BE LIGHT!");
-  Serial.print("Stairway light: pin ");
-  Serial.println(pLight, DEC);
-  Serial.print("Light time (ms): ");
-  Serial.println(light_length, DEC);
-  Serial.print("Sensors triggered by body within (inches): ");
-  Serial.println(ping_range/2/74, DEC); 
+  Serial.println("V3.0: LET THERE BE LIGHT");
+  
+  WiFi.begin(ssid, passwd);
+  timeClient.begin();
+  wdt_enable(WDT_PERIOD_8KCLK_gc); 
 
-  /* to ensure clean trigger for first ping */
-  delay(10);
+  form_log("SYSTEM BOOT V3.0");
 }
 
-/* subroutine: ping two range detectors
-   return results in 1 & 2 bits */
-int find_body() {
+void loop() {
+  wdt_reset(); 
+  unsigned long the_time = millis();
+  wifi_check();
+  timeClient.update();
+
+  int sensor = find_body();
+  if (sensor) {
+    if (sensor & 1) low_detect_time = the_time;
+    if (sensor & 2) up_detect_time = the_time;
+    
+    if (isItDark()) {
+      body_time = the_time;
+      if (!digitalRead(pLight)) {
+        digitalWrite(pLight, HIGH);
+        logTimeOn = the_time ? the_time : 1; 
+      } 
+      else if ((sensor & 2) && (the_time - low_detect_time < 40000) && (the_time - low_detect_time > 4000)) {
+        porch_on(); 
+      }
+    }
+  } 
+
+  if (digitalRead(pLight) && (the_time - body_time >= light_length)) {
+    digitalWrite(pLight, LOW);
+    logTimeOff = the_time ? the_time : 1;
+  }
+
+  if (porch_auto_off_time != 0 && (long)(the_time - porch_auto_off_time) >= 0) {
+    porch_off();
+  }
   
-  int body = 0;
-  unsigned long dist;
-
-  /* send ping with lower sensor */
-  digitalWrite(pTrigL, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(pTrigL, LOW);
-
-  /*  Wait for echo & set 1 bit if something is close enough. 
-   *  
-   *  The echo pulse should begin within about 250 microseconds, and the 
-   *  HC-SR04 should timeout the echo pulse in less than 40,000 
-   *  microseconds, so the timeout really should only be hit if there's 
-   *  a hardware fault.
-   *  
-   *  In my use case, dist should always be non-zero, because the
-   *  stairwell is less than 3 ft wide. So we could test only against
-   *  ping_range. But we will test for dist being non-zero anyway,
-   *  just in case we ever change the use case.
-   */
-  dist = pulseIn(pEchoL, HIGH, 40000);
-  if (dist < ping_range && dist) {    
-    body = 1;
-  }
- 
-  /* repeat with upper sensor, set 2 bit if something is detected */
-  digitalWrite(pTrigU, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(pTrigU, LOW);
-  dist = pulseIn(pEchoU, HIGH, 40000);
-  if (dist < ping_range && dist) {
-    body |= 2;
+  if (the_time - low_detect_time > 3000 && the_time - up_detect_time > 3000) {
+    bool loggedSomething = false;
+    for (int i = 0; i < numEvents; i++) {
+      if (*(events[i].timestamp) > 0) {
+        char logBuf[50];
+        sprintf(logBuf, "%s (%lus ago)", events[i].msg, (the_time - *(events[i].timestamp))/1000);
+        if (form_log(logBuf)) *(events[i].timestamp) = 0;
+        loggedSomething = true;
+        break; 
+      }
+    }
+    if (!loggedSomething) {
+      if (the_time - last_ssl_activity > ssl_keepalive_interval) keepSSLWarm();
+      else porchLightHeartbeat(the_time);
+    }
   }
 
+  updateStatusLEDs(the_time);
+  delay(100); 
+}
+
+/* --- KASA LOGIC --- */
+
+void sendKasaCommand(const char* msg) {
+  client.write((int)0); client.write((int)0);
+  client.write(highByte(strlen(msg))); client.write(lowByte(strlen(msg)));
+  int key = 0xAB;
+  for (int i = 0; msg[i] != '\0'; i++) client.write(key ^= msg[i]);
+}
+
+void porch_on() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  client.setTimeout(1500);
+  if (client.connect(porch_light_IP, porch_light_port)) {
+    sendKasaCommand("{\"system\":{\"get_sysinfo\":{}}}");
+    String resp = ""; unsigned long start = millis();
+    while (client.connected() && (millis() - start < 800)) {
+      if (client.available()) resp += (char)client.read();
+    }
+    client.stop();
+
+    if (resp.indexOf("\"relay_state\":1") == -1) { 
+      if (client.connect(porch_light_IP, porch_light_port)) {
+        sendKasaCommand("{\"system\":{\"set_relay_state\":{\"state\":1}}}");
+        client.stop();
+        porch_auto_off_time = millis() + porch_duration;
+        logTimePorchOn = millis() ? millis() : 1;
+      }
+    }
+  } else { logTimeKasaFail = millis() ? millis() : 1; }
+}
+
+void porch_off() {
+  if (WiFi.status() != WL_CONNECTED) { porch_auto_off_time = millis() + 10000; return; }
+  client.setTimeout(1500);
+  if (client.connect(porch_light_IP, porch_light_port)) {
+    sendKasaCommand("{\"system\":{\"set_relay_state\":{\"state\":0}}}");
+    client.stop();
+    porch_auto_off_time = 0;
+  } else { porch_auto_off_time = millis() + 60000; } 
+}
+
+/* --- NETWORK & UTILS --- */
+
+void keepSSLWarm() {
+  if (!client.connected()) {
+    client.stop(); client.setTimeout(2000); wdt_reset();
+    client.connectSSL("docs.google.com", 443);
+  } else {
+    client.println("X-KeepAlive: 1"); client.println();
+  }
+  last_ssl_activity = millis();
+}
+
+int form_log(char* msg) {
+  if (WiFi.status() != WL_CONNECTED) return 0;
+  if (!client.connected()) {
+    client.stop(); client.setTimeout(2000); wdt_reset();
+    if (!client.connectSSL("docs.google.com", 443)) return 0;
+  }
+  wdt_reset();
+  client.print("GET /forms/d/e/"); client.print(formID);
+  client.print("/formResponse?&submit=Submit?usp=pp_url&entry."); client.print(entryID); client.print("=");
+  while ( *msg != '\0') {
+    if (('a' <= *msg && *msg <= 'z') || ('A' <= *msg && *msg <= 'Z') || ('0' <= *msg && *msg <= '9') || *msg == '-' || *msg == '.' || *msg == '_' || *msg == '~') client.print(*msg);
+    else { client.print("%"); if ( *msg < 16 ) client.print("0"); client.print(*msg,HEX); }
+    msg++;
+  }
+  client.println(" HTTP/1.1"); client.println("Host: docs.google.com");
+  client.println("Connection: keep-alive"); client.println();
+  unsigned long t = millis();
+  while (client.connected() && millis() - t < 500) { if (client.available()) client.read(); }
+  last_ssl_activity = millis();
+  return 1;
+}
+
+void porchLightHeartbeat(unsigned long t) {
+  if (t - lastHeartbeat > heartbeatInterval) {
+    lastHeartbeat = t; 
+    if (WiFi.status() == WL_CONNECTED) {
+      client.setTimeout(1000);
+      if (client.connect(porch_light_IP, porch_light_port)) {
+        sendKasaCommand("{\"system\":{\"get_sysinfo\":{}}}");
+        client.stop();
+      }
+    }
+  }
+}
+
+int wifi_check() {
+  static bool was_connected = false; static unsigned long last_wifi_try = 0;
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!was_connected) { logTimeWiFi = millis() ? millis() : 1; was_connected = true; }
+    return 1; 
+  }
+  was_connected = false;
+  if (millis() - last_wifi_try < wifi_try_time) return 0;
+  last_wifi_try = millis(); WiFi.begin(ssid, passwd);
+  return (WiFi.status() == WL_CONNECTED);
+}
+
+int find_body() {
+  int body = 0; unsigned long dist;
+  digitalWrite(pTrigL, HIGH); delayMicroseconds(10); digitalWrite(pTrigL, LOW);
+  dist = pulseIn(pEchoL, HIGH, 25000);
+  if (dist < ping_range && dist) body = 1;
+  delay(2);
+  digitalWrite(pTrigU, HIGH); delayMicroseconds(10); digitalWrite(pTrigU, LOW);
+  dist = pulseIn(pEchoU, HIGH, 25000);
+  if (dist < ping_range && dist) body |= 2;
   return body;
 }
 
-/* subroutine: remote logging via a Google Form. 
- * sends msgs to console and, if possible, a Google Form
- * skips Form if no wifi or recent failed connection
- * 
- * returns 1 if Form connection succeeded, and 0 if not 
- */
-int form_log(char* msg) {
-
-  static unsigned long down_time = 0;
-
-  /* send message to console */
-  Serial.println(msg);
-
-  /* don't log to Google Form if no wifi */
-  if (WiFi.status() != WL_CONNECTED) {
-    return 0;
-  }
-  
-  /* connectSSL() is blocking, and a failed connection will block for ~30
-     seconds, so don't try if we've had a failure recently. */
-  if (down_time) {
-    if (millis() < down_time + connect_try_time) {
-      return 0; 
-    }
-    down_time = 0;
-  }
-
-  /* if no recent connection failure, open an https connection */
-  if (client.connectSSL("docs.google.com", 443)) {
-
-    /* beginning of GET for Google Form */
-    client.print("GET /forms/d/e/");
-    client.print(formID);
-    client.print("/formResponse?&submit=Submit?usp=pp_url&entry.");
-    client.print(entryID);
-    client.print("=");
-
-    /* percent encode the log entry, one char at a time */
-    while ( *msg != '\0') {
-      /* passthrough unreserved chars per RFC 3986 sec. 2.3 
-         ALPHA / DIGIT / "-" / "." / "_" / "~"               */
-      if (    ('a' <= *msg && *msg <= 'z') 
-           || ('A' <= *msg && *msg <= 'Z') 
-           || ('0' <= *msg && *msg <= '9') 
-           || *msg == '-' || *msg == '.' 
-           || *msg == '_' || *msg == '~'   ) {
-        client.print(*msg);
-      } 
-
-      /* percent encode everything else per RFC 3986 sec. 2.1 */ 
-      else {
-        client.print("%");
-        if ( *msg < 16 ) {
-          client.print("0"); // add leading zero if necessary
-        }
-        client.print(*msg,HEX);
-      }
-      msg++; // next character in the log entry
-    }
-
-    client.println(" HTTP/1.1"); // end of GET
-    
-    client.println("Host: docs.google.com");
-    client.println("Connection: close");
-    client.println();
-
-    client.stop();
-
-    return 1;   // logged entry
-  }
-
-  /* https connection failed */
-  down_time = millis();
-  Serial.println("Connection to Google Form failed.");
-  return 0;
-  
-}
-
-/* subroutine: tell porch light to turn on using TSHP. 
-   returns 1 if successful */
-int porch_on() {
-
-  static unsigned long down_time = 0;
-
-  /* connect() is blocking, and a failed connection will block for ~30
-     seconds, so don't try if we've had a failure recently. */
-  if (down_time) {
-    if (millis() < down_time + connect_try_time) {
-      return 0; 
-    }
-    down_time = 0;
-  }
-
-  /* if no recent connection failure, try to send the Kasa switch an
-     "on" message via TCP and TSHP */ 
-  if (client.connect(porch_light_IP, porch_light_port)) {
-
-    /* send TSHP length header (used by TSHP for TCP but not UDP) */
-    client.write((int)0);
-    client.write((int)0);
-    client.write(highByte(strlen(msg_on)));
-    client.write(lowByte(strlen(msg_on)));
-    
-    /* send TSHP payload (with required weak obfuscation) */
-    int key = 0xAB; // TSHP magic number
-    for (int i = 0; msg_on[i] != '\0'; i++) {
-      client.write(key ^= msg_on[i]);
-    }
-    client.stop();
-    
-    form_log("Asked Kasa to turn on porch light.");
-    
-    return 1; // connection succeeded
-  }
-  
-  /* Kasa connection failed */
-  down_time = millis();
-  Serial.println("Connection to Kasa light switch failed.");
-
-  return 0;
-}
-
-/* subroutine: check wifi and connect if needed
- * won't try if failed recently, except multiple tries are allowed at startup
- * 
- * returns 1 if connected
- */
-int wifi_check() {
-  static unsigned long wifi_last_attempt = -wifi_try_time;
-    
+bool isItDark() {
   unsigned long the_time = millis();
-  int wifi_status = WiFi.status();
+  unsigned long epochTime = timeClient.getEpochTime();
+  int currentMin = (timeClient.getHours() * 60) + timeClient.getMinutes();
+  
+  if (epochTime < 1735689600UL) return (currentMin >= 1020 || currentMin <= 480);
 
-  /* if we're connected, all is well */
-  if (wifi_status == WL_CONNECTED) {
-    return 1; 
+  if (the_time - lastSunUpdate > 3600000UL) {
+    bool isDST = (month(epochTime) > 3 && month(epochTime) < 11);
+    cachedSunrise = sf.sunrise(year(epochTime), month(epochTime), day(epochTime), isDST); 
+    cachedSunset  = sf.sunset(year(epochTime), month(epochTime), day(epochTime), isDST);
+    lastSunUpdate = the_time;
   }
 
-  /* if we had a failed attempt recently and it's not shortly after
-     shortly after power up, don't try again, because WiFi.begin()
-     is blocking and takes 3-5 seconds */
-  if (the_time < wifi_last_attempt + wifi_try_time) {
-    return 0;
-  }
-
-  /* update last attempt time unless recently powered up */
-  if (the_time > wifi_try_time) {
-    wifi_last_attempt = the_time;
-  }
-
-  /* report connection attempt to console */
-  Serial.print("Connecting to ");
-  Serial.print(ssid);
-  Serial.print(" WiFi AP because status is: ");
-  switch (wifi_status) {
-    case WL_IDLE_STATUS:
-      Serial.println("IDLE.");
-      break;
-    case WL_CONNECT_FAILED:
-      Serial.println("CONNECT_FAILED.");
-      break;
-    case WL_CONNECTION_LOST:
-      Serial.println("CONNECTION_LOST.");
-      break;
-    case WL_DISCONNECTED:
-      Serial.println("DISCONNECTED.");
-      break;
-    default:
-      Serial.print("code ");
-      Serial.print(wifi_status,DEC);
-      Serial.println(".");
-      break;
-  }
-
-  /* actual connection attempt */
-  if (WiFi.begin(ssid, passwd) == WL_CONNECTED) {
-    form_log("WiFi CONNECTED.");
-    return 1;
-  }
-  Serial.println("WiFi did not connect.");
-  return 0;
-
+  return (currentMin >= (cachedSunset - 15) || currentMin <= (cachedSunrise + 15));
 }
 
-/***************
- *             *
- *  MAIN LOOP  *
- *             *
- ***************/
-void loop() {
-
-  /* one-time initialization, variables survive looping 
-     initializing to -light_length basically means "a long time ago" */
-  static unsigned long 
-    body_time = -light_length,  // last time body detected
-    low_time = -light_length,   // last time body detected at low sensor
-    ping_time = 60UL*60*1000;   // one hour from start up
-  static int up_down;           // sensor that triggered light
-  
-  /****
-   * 
-   * Our approach is to loop repeatedly through this task list:
-   *   (a) connect to WiFi if needed;
-   *   (b) check our two range sensors;
-   *     (1) if we found something, then
-   *       - if light off, turn on; 
-   *       - if light on & someone is going up, turn on porch light;
-   *     (2) if found nothing, then see if we should turn light off;
-   *   (c) pause to limit looping to ten times per second.
-   * 
-   ****/
-
-  /* Check wifi, and attempt to connect if needed */
-  int wifi_status = wifi_check();  
-
-  /* log proof of life every hour */
-  unsigned long the_time = millis(); 
-  if (the_time > ping_time) {
-    form_log("Hourly ping.");
-    ping_time += 60UL*60*1000;
-  }
-
-  /* check range sensors and process results */  
-  if ( int sensor = find_body() ) {
-    
-    body_time = the_time;
-
-    if (sensor & 1) {
-      Serial.println("Lower sensor triggered.");    
-      low_time = the_time;  
-    }
-    if (sensor & 2) {
-      Serial.println("Upper sensor triggered.");  
-    }
-
-    /* Body found & light off: turn on light */
-    if (! digitalRead(pLight)) {
- 
-      digitalWrite(pLight, HIGH);
-      digitalWrite(LED_BUILTIN, HIGH);
-
-      up_down = sensor;
-
-      form_log("Stairway light on");
- 
-    } /* end body found & light off */
-
-    /* body found & light on */
-    /* turn on porch light if sosmeone moving from lower to upper and we have wifi */
-    else if (sensor & 2 
-          && up_down == 1 
-          && the_time < low_time + light_length 
-          && wifi_status ) {
-      porch_on();
-    } /* end body found & light on */
-
-  } /* end body found*/
-
-  /*  
-   *  No body found:
-   *  
-   *  If stairway light is on
-   *  AND last body detected was at least light_length ago
-   *  THEN turn off stairway light.
-   */
-  else if (digitalRead(pLight) && the_time > body_time + light_length) {
-    digitalWrite(pLight, LOW);
-    digitalWrite(LED_BUILTIN, LOW);
-    form_log("Stairway light off.");
-  } /* end no body found */
-
-  /* delay so that we loop no more than 10 times per second */
-  while (millis() < the_time + 100) {
-    ;
-  }
-} /* end loop() */
+void updateStatusLEDs(unsigned long t) {
+  digitalWrite(pLedRelay, digitalRead(pLight));
+  digitalWrite(pLedLower, (t - low_detect_time < 300000 && low_detect_time != 0));
+  digitalWrite(pLedUpper, (t - up_detect_time < 300000 && up_detect_time != 0));
+  digitalWrite(LED_BUILTIN, (WiFi.status() == WL_CONNECTED));
+}
