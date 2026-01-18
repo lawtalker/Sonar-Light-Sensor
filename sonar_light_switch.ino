@@ -58,19 +58,11 @@
  *  either sensor will trigger the stairway light. The light stays on until 
  *  no body is detected at either sensor for a set period of time.
  *  
- *  If we determine that someone is walking up the stairs (i.e. the light
- *  was turned on because someone walked through the lower sensor, and they
- *  then walked through the upper sensor), we also send a message to the 
- *  porch light switch to turn the porch light on. We do not ever turn the 
- *  porch light off, because the light might have been turned on manually, 
- *  and we don't want to turn it off in that case.
- * 
- *  Note that if someone comes and drops off a package (walking through the 
- *  lower and then the upper sensor), this could leave the porch light on 
- *  until morning (when the smart switch is programmed to turn off the 
- *  light). But this could also help us notice that something has been 
- *  dropped off. 
- * 
+ *  If we determine that someone is walking up the stairs (i.e. someone 
+ *  walked through the lower sensor, and they then walked through the upper 
+ *  sensor), we also send a message to the porch light switch to turn the 
+ *  porch light on (if it's not already on), and turn it off after a while.
+ *
  *  (We actually also have a third light, between the stairway light and the
  *  porch light. That light is controlled via its own integrated PIR sensor, 
  *  which operates entirely independently of the porch and stairway lights.)
